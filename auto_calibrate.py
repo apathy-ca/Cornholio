@@ -68,16 +68,24 @@ def _compute_temporal_median(
     return median
 
 
-def _find_board_corners(frame: np.ndarray, zone: tuple, label: str) -> np.ndarray | None:
+def _find_board_corners(
+    frame: np.ndarray,
+    zone: tuple,
+    label: str,
+    v_min: int = 155,
+) -> np.ndarray | None:
     """
     Find the 4 corners of a cornhole board within zone (x1,y1,x2,y2).
 
-    Strategy: threshold for the bright white playing surface (high V, low S in HSV),
-    find the largest white blob, fit a rotated rectangle, then enforce 2:1 aspect ratio
-    to account for the dark design pattern that truncates the detected white area.
+    v_min — minimum HSV V value. Use 170 for near board (filters floor
+    contamination that appears at V>155 but S<60). Far board needs 155.
 
-    First tries convex-hull quad-fit (better for perspectively distorted boards),
-    falls back to minAreaRect + 2:1 correction.
+    Strategy:
+      1. Threshold for bright white/cream playing surface (high V, low S).
+      2. Try convex-hull quad-fit; accept if all 4 corners are distinct and
+         at most 1 touches the zone boundary (one corner may legitimately
+         sit at the board edge that aligns with the zone boundary).
+      3. Fall back to minAreaRect + 2:1 aspect correction.
 
     Returns (4,2) float32 array in image coordinates, or None on failure.
     """
@@ -86,9 +94,9 @@ def _find_board_corners(frame: np.ndarray, zone: tuple, label: str) -> np.ndarra
     cw, ch = x2 - x1, y2 - y1
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    # Board playing surface: bright white/cream, low saturation
-    # S<60 keeps floor reflections out (floor S≈60-80, board S<55)
-    white_mask = cv2.inRange(hsv, (0, 0, 155), (180, 60, 255))
+    # Low saturation (S<60) excludes floor/wall; v_min separates board from
+    # lower-brightness gray floor (near board zone contaminated at V>155).
+    white_mask = cv2.inRange(hsv, (0, 0, v_min), (180, 60, 255))
 
     # Morphological cleanup
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
@@ -115,19 +123,53 @@ def _find_board_corners(frame: np.ndarray, zone: tuple, label: str) -> np.ndarra
     area, best_cnt = max(valid)
 
     # Try to fit a proper quadrilateral via convex hull + approxPolyDP.
-    # This handles perspective distortion (board appears as trapezoid, not rectangle).
+    # Accept if all 4 corners are distinct and at most 1 touches the crop boundary
+    # (the board's actual corner may sit exactly at the zone edge).
+    EDGE_MARGIN = 8  # px from crop border considered "on boundary"
     hull = cv2.convexHull(best_cnt)
     peri = cv2.arcLength(hull, True)
     box = None
-    for eps_frac in (0.04, 0.06, 0.08, 0.10):
+    for eps_frac in (0.04, 0.05, 0.06, 0.08, 0.10):
         poly = cv2.approxPolyDP(hull, eps_frac * peri, True)
-        if len(poly) == 4:
-            box = poly.reshape(4, 2).astype(np.float32)
-            print(f"  [{label}] Quad fit at eps={eps_frac:.2f}: {box.astype(int).tolist()}")
+        if len(poly) != 4:
+            continue
+        pts4 = poly.reshape(4, 2).astype(np.float32)
+        # Reject degenerate quads (two identical corners)
+        diffs = [np.linalg.norm(pts4[i] - pts4[j])
+                 for i in range(4) for j in range(i + 1, 4)]
+        if min(diffs) < 5:
+            continue
+        on_boundary = int(
+            (pts4[:, 0] < EDGE_MARGIN).any()
+            + (pts4[:, 0] > cw - EDGE_MARGIN).any()
+            + (pts4[:, 1] < EDGE_MARGIN).any()
+            + (pts4[:, 1] > ch - EDGE_MARGIN).any()
+        )
+        if on_boundary <= 1:
+            # Verify sorted corners are all distinct (non-rectangular quads
+            # can fool _sort_corners into producing duplicate points).
+            candidate = pts4.copy()
+            candidate[:, 0] += x1
+            candidate[:, 1] += y1
+            srt = _sort_corners(candidate)
+            srt_dists = [np.linalg.norm(srt[i] - srt[j])
+                         for i in range(4) for j in range(i + 1, 4)]
+            if min(srt_dists) < 5:
+                print(f"  [{label}] Quad at eps={eps_frac:.2f} rejected "
+                      f"(degenerate after sort)")
+                continue
+            box = pts4
+            print(f"  [{label}] Quad fit at eps={eps_frac:.2f} "
+                  f"(boundary_edges={on_boundary}): {box.astype(int).tolist()}")
             break
+        else:
+            print(f"  [{label}] Quad at eps={eps_frac:.2f} rejected "
+                  f"(boundary_edges={on_boundary})")
 
     if box is None:
-        # Fallback: minAreaRect + 2:1 aspect correction
+        # Fallback: minAreaRect + 2:1 aspect correction.
+        # The dark board design truncates the detected white region along the long
+        # axis; extend it so the long dimension = 2× the short dimension.
         mar = cv2.minAreaRect(best_cnt)
         w_det, h_det = mar[1]
         if min(w_det, h_det) < 10:
@@ -141,7 +183,7 @@ def _find_board_corners(frame: np.ndarray, zone: tuple, label: str) -> np.ndarra
             corrected_rect = (mar[0], (w_det, long_corrected), mar[2])
         box = cv2.boxPoints(corrected_rect).astype(np.float32)
         print(f"  [{label}] minAreaRect fallback: {w_det:.0f}×{h_det:.0f} "
-              f"(aspect {detected_aspect:.2f}) → corrected to 2:1")
+              f"(aspect {detected_aspect:.2f}) → 2:1 corrected")
 
     # Save debug overlay: contour + detected corners on the crop
     debug_crop = crop.copy()
@@ -174,32 +216,62 @@ def _sort_corners(pts: np.ndarray) -> np.ndarray:
 def _find_hole(rect_img: np.ndarray, label: str) -> tuple[int, int, int]:
     """
     Find the hole in a rectified board image.
-    Returns (cx, cy, radius). Falls back to nominal if HoughCircles fails.
+    Returns (cx, cy, radius). Falls back to nominal if detection fails.
+
+    Masks the image border (15px) to suppress warp-edge artifacts before
+    searching for the darkest circular region.
     """
     gray = cv2.cvtColor(rect_img, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+
+    # Blur on the original gray (unmasked) so edges don't contaminate the blur
     blur = cv2.GaussianBlur(gray, (9, 9), 2)
 
-    circles = cv2.HoughCircles(
-        blur,
-        cv2.HOUGH_GRADIENT,
-        dp=1,
-        minDist=30,
-        param1=50,
-        param2=20,
-        minRadius=15,
-        maxRadius=50,
-    )
+    # Mask the blurred image AFTER blurring.
+    # Bottom third is masked because the warp often extends outside the board
+    # into dark background below the playing surface.
+    BORDER = 15
+    blur_masked = blur.copy()
+    blur_masked[:BORDER, :] = 255
+    blur_masked[h_img * 2 // 3:, :] = 255   # bottom third
+    blur_masked[:, :BORDER] = 255
+    blur_masked[:, -BORDER:] = 255
 
-    if circles is None:
-        print(f"  [{label}] HoughCircles found no circles; using nominal position")
-        return RECT_HOLE[0], RECT_HOLE[1], RECT_HOLE_R
+    # Try increasingly permissive params. Hole V is typically <40 in the warp.
+    for param1, param2, minR, maxR in [
+        (30, 10, 8, 70),
+        (25, 8,  6, 80),
+        (20, 6,  5, 80),
+    ]:
+        circles = cv2.HoughCircles(
+            blur_masked, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
+            param1=param1, param2=param2, minRadius=minR, maxRadius=maxR,
+        )
+        if circles is None:
+            continue
+        circles = np.round(circles[0]).astype(int)
+        valid = [c for c in circles
+                 if BORDER <= c[0] < w_img - BORDER
+                 and BORDER <= c[1] < h_img * 2 // 3]
+        if not valid:
+            continue
+        best = min(valid, key=lambda c: int(gray[c[1], c[0]]))
+        cx, cy, r = int(best[0]), int(best[1]), int(best[2])
+        if gray[cy, cx] < 60:
+            print(f"  [{label}] Hole at ({cx},{cy}) r={r} V={gray[cy,cx]} "
+                  f"(param2={param2})")
+            return cx, cy, r
 
-    circles = np.round(circles[0]).astype(int)
-    # Pick the darkest circle center — hole should be the darkest region
-    best = min(circles, key=lambda c: int(gray[c[1], c[0]]))
-    cx, cy, r = int(best[0]), int(best[1]), int(best[2])
-    print(f"  [{label}] Hole at ({cx},{cy}) r={r}")
-    return cx, cy, r
+    # Fallback: darkest pixel within the search region
+    search_region = gray[:h_img * 2 // 3, BORDER:w_img - BORDER]
+    min_val, _, min_loc, _ = cv2.minMaxLoc(search_region)
+    if min_val < 40:
+        abs_loc = (min_loc[0] + BORDER, min_loc[1])
+        print(f"  [{label}] Hole from darkest pixel: {abs_loc} V={min_val:.0f}")
+        return abs_loc[0], abs_loc[1], RECT_HOLE_R
+
+    print(f"  [{label}] No dark hole found; using nominal position")
+    return RECT_HOLE[0], RECT_HOLE[1], RECT_HOLE_R
 
 
 def _find_bag_colors(
@@ -232,7 +304,7 @@ def _find_bag_colors(
         if blue_mask.any():
             blue_pixels.extend(hsv[blue_mask > 0].tolist())
 
-    def hsv_range(pixels, tolerance=(12, 50, 50)):
+    def hsv_range(pixels, tolerance=(10, 40, 40)):
         if not pixels:
             return [0, 100, 80], [15, 255, 255]
         arr = np.array(pixels, dtype=np.float32)
@@ -240,7 +312,28 @@ def _find_bag_colors(
         hi = np.clip(arr.max(axis=0) + tolerance, 0, [179, 255, 255]).tolist()
         return lo, hi
 
-    red_lo, red_hi = hsv_range(red_pixels)
+    def red_hsv_range(pixels):
+        """Red hue wraps around 0/180; split into lower (H<30) and upper (H>150)."""
+        if not pixels:
+            return [0, 100, 80], [15, 255, 255]
+        arr = np.array(pixels, dtype=np.float32)
+        lower = arr[arr[:, 0] <= 30]   # H≈0-15
+        upper = arr[arr[:, 0] >= 150]  # H≈155-180
+        # Use whichever cluster has more pixels; combine S/V from all pixels
+        sv_arr = np.vstack([lower, upper]) if len(lower) and len(upper) else arr
+        sv_lo = sv_arr[:, 1:].min(axis=0) - np.array([40, 40])
+        sv_hi = sv_arr[:, 1:].max(axis=0) + np.array([40, 40])
+        if len(lower) >= len(upper):
+            h_lo = max(0, float(lower[:, 0].min()) - 10)
+            h_hi = min(15, float(lower[:, 0].max()) + 10)
+        else:
+            h_lo = max(150, float(upper[:, 0].min()) - 10)
+            h_hi = min(179, float(upper[:, 0].max()) + 10)
+        lo = [h_lo, float(np.clip(sv_lo[0], 0, 255)), float(np.clip(sv_lo[1], 0, 255))]
+        hi = [h_hi, 255.0, 255.0]
+        return lo, hi
+
+    red_lo, red_hi = red_hsv_range(red_pixels)
     blue_lo, blue_hi = hsv_range(blue_pixels)
 
     print(f"  Red:  {len(red_pixels)} pixels  HSV {[int(x) for x in red_lo]} → {[int(x) for x in red_hi]}")
@@ -275,10 +368,12 @@ def auto_calibrate(
         color_img = geo_img
 
     # ── detect board corners ──────────────────────────────────────────────────
+    # Near board: V>170 required — at V>155 the floor contaminates the zone
+    # with a huge 70k-px blob; V>170 isolates just the board surface (~26k px).
     print("\nDetecting near board corners...")
-    near_corners = _find_board_corners(geo_img, NEAR_ZONE, "near")
+    near_corners = _find_board_corners(geo_img, NEAR_ZONE, "near", v_min=170)
     print("Detecting far board corners...")
-    far_corners = _find_board_corners(geo_img, FAR_ZONE, "far")
+    far_corners = _find_board_corners(geo_img, FAR_ZONE, "far", v_min=155)
 
     if near_corners is None or far_corners is None:
         raise RuntimeError(
