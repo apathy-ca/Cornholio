@@ -1,0 +1,11 @@
+*.mp4
+*.avi
+*.mov
+*.mkv
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.jpg
+*.png
+calibration.json
