@@ -48,7 +48,8 @@ class BoardScorer:
         self.rect_w = config["board"]["rect_w_px"]
         self.rect_h = config["board"]["rect_h_px"]
         hole_cfg = config["hole"]
-        self.hole_center = tuple(hole_cfg["near_center_rect"])  # same for both boards
+        hole_key = "near_center_rect" if board_key == "near_board" else "far_center_rect"
+        self.hole_center = tuple(hole_cfg[hole_key])
         self.hole_radius = hole_cfg["rect_radius_px"]
 
         color_cfg = config["colors"]
@@ -56,6 +57,16 @@ class BoardScorer:
         self.red_hi = np.array(color_cfg["red"]["hsv_hi"], dtype=np.uint8)
         self.blue_lo = np.array(color_cfg["blue"]["hsv_lo"], dtype=np.uint8)
         self.blue_hi = np.array(color_cfg["blue"]["hsv_hi"], dtype=np.uint8)
+
+        # Background subtraction: mask pixels matching the static board design
+        median_path = board_cfg.get("median_warp_path")
+        self.median_warp: Optional[np.ndarray] = None
+        self.bg_diff_threshold = 30  # per-channel absolute diff to count as "changed"
+        if median_path:
+            try:
+                self.median_warp = np.load(median_path)
+            except FileNotFoundError:
+                pass  # calibration.json may be used without the .npy files
 
         # Expected bag area in rectified pixels: a 6"x6" bag ~= 60x60px = 3600px²
         # Allow 0.3x to 2.5x that range
@@ -69,10 +80,12 @@ class BoardScorer:
     def _hsv_mask(self, hsv: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
         # Handle hue wrap-around for red (hue near 0/180)
         if lo[0] > hi[0]:  # wrap-around case (e.g., hue 170-10)
-            m1 = cv2.inRange(hsv, np.array([lo[0], lo[1], lo[2]]),
-                             np.array([179, hi[1], hi[2]]))
-            m2 = cv2.inRange(hsv, np.array([0, lo[1], lo[2]]),
-                             np.array([hi[0], hi[1], hi[2]]))
+            m1 = cv2.inRange(hsv,
+                             np.array([lo[0], lo[1], lo[2]], dtype=np.uint8),
+                             np.array([179,   hi[1], hi[2]], dtype=np.uint8))
+            m2 = cv2.inRange(hsv,
+                             np.array([0,     lo[1], lo[2]], dtype=np.uint8),
+                             np.array([hi[0], hi[1], hi[2]], dtype=np.uint8))
             return cv2.bitwise_or(m1, m2)
         return cv2.inRange(hsv, lo, hi)
 
@@ -92,38 +105,56 @@ class BoardScorer:
             if area < self.bag_area_min:
                 continue
 
-            if area > self.bag_area_expected * 2.5:
-                flagged = True  # Possibly stacked bags
-
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
             cx = int(M["m10"] / M["m00"])
             cy = int(M["m01"] / M["m00"])
 
-            dist = np.hypot(cx - self.hole_center[0], cy - self.hole_center[1])
+            # Estimate how many bags this contour represents.
+            # With background subtraction, large blobs are stacked/touching bags,
+            # not board design artifacts.
+            if area > self.bag_area_expected * 2.5:
+                flagged = True
+                count = min(4, max(1, round(area / self.bag_area_expected)))
+            else:
+                count = 1
 
+            dist = np.hypot(cx - self.hole_center[0], cy - self.hole_center[1])
             if dist <= self.hole_radius:
-                in_hole += 1
-            elif area <= self.bag_area_max:
-                on_board += 1
+                in_hole += count
+            else:
+                on_board += count
 
         return BoardCount(on_board=on_board, in_hole=in_hole, flagged=flagged)
+
+    def _bg_changed_mask(self, rect: np.ndarray) -> np.ndarray:
+        """
+        Returns a uint8 mask (255 where changed, 0 where static background).
+        A pixel is considered "changed" if any BGR channel differs from the
+        temporal median by more than bg_diff_threshold.
+        """
+        if self.median_warp is None:
+            return np.full(rect.shape[:2], 255, dtype=np.uint8)
+        diff = np.abs(rect.astype(np.int16) - self.median_warp.astype(np.int16))
+        return (diff.max(axis=2) > self.bg_diff_threshold).astype(np.uint8) * 255
 
     def score_frame(self, frame: np.ndarray) -> tuple[BoardCount, BoardCount]:
         """Returns (red_count, blue_count) for a single frame."""
         rect = self.rectify(frame)
+        changed = self._bg_changed_mask(rect)
         hsv = cv2.cvtColor(rect, cv2.COLOR_BGR2HSV)
-        red_mask = self._hsv_mask(hsv, self.red_lo, self.red_hi)
-        blue_mask = self._hsv_mask(hsv, self.blue_lo, self.blue_hi)
+        red_mask = cv2.bitwise_and(self._hsv_mask(hsv, self.red_lo, self.red_hi), changed)
+        blue_mask = cv2.bitwise_and(self._hsv_mask(hsv, self.blue_lo, self.blue_hi), changed)
         return self._count_bags(red_mask), self._count_bags(blue_mask)
 
     def debug_overlay(self, frame: np.ndarray) -> np.ndarray:
         """Returns rectified board with detection overlay."""
         rect = self.rectify(frame)
+        changed = self._bg_changed_mask(rect)
         hsv = cv2.cvtColor(rect, cv2.COLOR_BGR2HSV)
-        red_mask = self._hsv_mask(hsv, self.red_lo, self.red_hi)
-        blue_mask = self._hsv_mask(hsv, self.blue_lo, self.blue_hi)
+        red_mask = cv2.bitwise_and(self._hsv_mask(hsv, self.red_lo, self.red_hi), changed)
+        blue_mask = cv2.bitwise_and(self._hsv_mask(hsv, self.blue_lo, self.blue_hi), changed)
 
         overlay = rect.copy()
         overlay[red_mask > 0] = [0, 0, 200]

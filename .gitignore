@@ -9,3 +9,6 @@ __pycache__/
 *.jpg
 *.png
 calibration.json
+median_warp_*.npy
+*.pt
+player_id.json

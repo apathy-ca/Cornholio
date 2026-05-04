@@ -385,10 +385,19 @@ def auto_calibrate(
     H_near = cv2.getPerspectiveTransform(near_corners, rect_corners)
     H_far  = cv2.getPerspectiveTransform(far_corners,  rect_corners)
 
-    # ── detect holes ──────────────────────────────────────────────────────────
-    print("\nDetecting holes...")
+    # ── save median warps for background subtraction ──────────────────────────
+    print("\nSaving median warps for background subtraction...")
+    output_dir = Path(output_path).parent
     near_rect = cv2.warpPerspective(geo_img, H_near, (RECT_W, RECT_H))
     far_rect  = cv2.warpPerspective(geo_img, H_far,  (RECT_W, RECT_H))
+    near_warp_path = str(output_dir / "median_warp_near.npy")
+    far_warp_path  = str(output_dir / "median_warp_far.npy")
+    np.save(near_warp_path, near_rect)
+    np.save(far_warp_path, far_rect)
+    print(f"  Saved {near_warp_path}, {far_warp_path}")
+
+    # ── detect holes ──────────────────────────────────────────────────────────
+    print("\nDetecting holes...")
     near_hole = _find_hole(near_rect, "near")
     far_hole  = _find_hole(far_rect,  "far")
 
@@ -414,11 +423,13 @@ def auto_calibrate(
             "corners_px": near_corners.tolist(),
             "hole_center_px": list(near_hole[:2]),
             "homography": H_near.tolist(),
+            "median_warp_path": near_warp_path,
         },
         "far_board": {
             "corners_px": far_corners.tolist(),
             "hole_center_px": list(far_hole[:2]),
             "homography": H_far.tolist(),
+            "median_warp_path": far_warp_path,
         },
         "colors": {
             "red":  {"hsv_lo": red_lo,  "hsv_hi": red_hi},
